@@ -63,8 +63,8 @@ EMOJI = {
     "settings": "⚙️"
 }
 
-# Права для активного пользователя
-ACTIVE_PERMISSIONS = {
+# Права которые будут выдаваться (для отдельной таблицы)
+PERMISSIONS_JSON = {
     "view_logs": True,
     "view_admin_logs": True,
     "view_forbes": True,
@@ -86,7 +86,7 @@ def get_db():
         logger.error(f"Ошибка MySQL: {e}")
         return None
 
-# Получить всех пользователей
+# Получить всех пользователей (только из site_users)
 def get_users():
     conn = get_db()
     if not conn:
@@ -97,7 +97,13 @@ def get_users():
         cursor.execute("""
             SELECT id, username, email, status 
             FROM site_users 
-            ORDER BY username
+            ORDER BY 
+                CASE status 
+                    WHEN 'active' THEN 1 
+                    WHEN 'inactive' THEN 2 
+                    ELSE 3 
+                END,
+                username
         """)
         users = cursor.fetchall()
         conn.close()
@@ -122,7 +128,7 @@ def get_user(user_id):
         logger.error(f"Ошибка получения пользователя: {e}")
         return None
 
-# Обновить статус пользователя (с правами для active)
+# Обновить статус в site_users (только active/inactive)
 def update_user_status(user_id, new_status):
     conn = get_db()
     if not conn:
@@ -130,17 +136,10 @@ def update_user_status(user_id, new_status):
     
     try:
         cursor = conn.cursor()
-        
-        if new_status == 'active':
-            # Для active - сохраняем JSON со всеми правами
-            status_value = json.dumps(ACTIVE_PERMISSIONS, ensure_ascii=False)
-        else:
-            # Для inactive - пустая строка
-            status_value = ''
-        
+        # Меняем только status, никаких JSON тут нет
         cursor.execute(
             "UPDATE site_users SET status = %s WHERE id = %s",
-            (status_value, user_id)
+            (new_status, user_id)
         )
         conn.commit()
         affected = cursor.rowcount
@@ -154,48 +153,55 @@ def update_user_status(user_id, new_status):
         logger.error(f"Ошибка обновления: {e}")
         return False, str(e)
 
-# Проверка статуса пользователя
-def check_user_status(status_value):
-    if not status_value:
-        return False, EMOJI['inactive'], "Inactive"
+# Обновить permissions в site_user
+def update_user_permissions(user_id):
+    conn = get_db()
+    if not conn:
+        return False, "Нет подключения к БД"
     
     try:
-        # Пробуем распарсить JSON
-        if status_value.startswith('{'):
-            perms = json.loads(status_value)
-            # Проверяем что это наши права
-            if isinstance(perms, dict) and any(perms.values()):
-                return True, EMOJI['active'], "Active"
-    except:
-        pass
-    
-    # Проверяем на обычный active
-    if status_value == 'active':
-        return True, EMOJI['active'], "Active"
-    
-    return False, EMOJI['inactive'], "Inactive"
+        cursor = conn.cursor()
+        
+        # Проверяем есть ли уже запись в site_user
+        cursor.execute("SELECT id FROM site_user WHERE user_id = %s", (user_id,))
+        exists = cursor.fetchone()
+        
+        permissions_json = json.dumps(PERMISSIONS_JSON, ensure_ascii=False)
+        
+        if exists:
+            # Обновляем существующую запись
+            cursor.execute(
+                "UPDATE site_user SET permissions = %s WHERE user_id = %s",
+                (permissions_json, user_id)
+            )
+        else:
+            # Создаем новую запись
+            cursor.execute(
+                "INSERT INTO site_user (user_id, permissions) VALUES (%s, %s)",
+                (user_id, permissions_json)
+            )
+        
+        conn.commit()
+        conn.close()
+        
+        return True, "Права обновлены"
+    except Error as e:
+        logger.error(f"Ошибка обновления прав: {e}")
+        return False, str(e)
 
 # Старт
 @dp.message_handler(commands=['start'])
 async def start(message: types.Message):
     text = f"""
-{EMOJI['rocket']} <b>Admin Bot с правами</b>
+{EMOJI['rocket']} <b>Admin Bot</b>
 ━━━━━━━━━━━━━━━━━━━━━━
 {EMOJI['mysql']} MySQL: {MYSQL_CONFIG['host']}
-{EMOJI['users']} Таблица: site_users
 
-{EMOJI['perms']} <b>Права для Active:</b>
-• view_logs
-• view_admin_logs
-• view_forbes
-• view_bonus_codes
-• view_server_config
-• edit_server_config
-• view_numbers
-• view_bans
-• view_money_logs
-• view_manage_users
-• manage_users
+{EMOJI['users']} <b>Таблица site_users:</b>
+• status: active / inactive
+
+{EMOJI['perms']} <b>Таблица site_user:</b>
+• permissions: JSON со всеми правами
 
 /menu - список пользователей
 /checkdb - проверить БД
@@ -223,15 +229,8 @@ async def show_users(message: types.Message):
         return
     
     # Статистика
-    active = 0
-    inactive = 0
-    
-    for user in users:
-        is_active, _, _ = check_user_status(user['status'])
-        if is_active:
-            active += 1
-        else:
-            inactive += 1
+    active = sum(1 for u in users if u['status'] == 'active')
+    inactive = sum(1 for u in users if u['status'] == 'inactive')
     
     header = f"""
 {EMOJI['users']} <b>Пользователи</b> ({len(users)})
@@ -243,8 +242,11 @@ async def show_users(message: types.Message):
     kb = InlineKeyboardMarkup(row_width=1)
     
     for user in users:
-        # Определяем статус для иконки
-        is_active, status_emoji, _ = check_user_status(user['status'])
+        # Статус для иконки
+        if user['status'] == 'active':
+            status_emoji = EMOJI['active']
+        else:
+            status_emoji = EMOJI['inactive']
         
         # Имя и email
         name = (user['username'] or "Без имени")[:15]
@@ -292,25 +294,39 @@ async def user_selected(callback: types.CallbackQuery, state: FSMContext):
     )
     
     # Текущий статус
-    is_active, status_emoji, status_text = check_user_status(user['status'])
+    if user['status'] == 'active':
+        status_text = f"{EMOJI['active']} Active"
+    else:
+        status_text = f"{EMOJI['inactive']} Inactive"
     
     info = f"""
 {EMOJI['info']} <b>Информация о пользователе</b>
 ━━━━━━━━━━━━━━━━━━━━━━
 👤 <b>Имя:</b> {user['username']}
 📧 <b>Email:</b> {user['email']}
-{status_emoji} <b>Текущий статус:</b> {status_text}
+{EMOJI['arrow']} <b>Текущий статус:</b> {status_text}
 
-{EMOJI['perms']} <b>Права для Active:</b>
-• Все 11 прав доступа
-• Полный доступ к админке
+{EMOJI['perms']} <b>При активации (Active) будут выданы права:</b>
+• view_logs
+• view_admin_logs
+• view_forbes
+• view_bonus_codes
+• view_server_config
+• edit_server_config
+• view_numbers
+• view_bans
+• view_money_logs
+• view_manage_users
+• manage_users
+
+<b>Куда:</b> в таблицу site_user (permissions)
 
 {EMOJI['arrow']} <b>Выбери новый статус:</b>
     """
     
     kb = InlineKeyboardMarkup(row_width=2)
     kb.add(
-        InlineKeyboardButton(f"{EMOJI['active']} Active (с правами)", callback_data="set_active"),
+        InlineKeyboardButton(f"{EMOJI['active']} Active (выдать права)", callback_data="set_active"),
         InlineKeyboardButton(f"{EMOJI['inactive']} Inactive", callback_data="set_inactive"),
         InlineKeyboardButton(f"{EMOJI['cancel']} Отмена", callback_data="cancel")
     )
@@ -333,36 +349,35 @@ async def status_selected(callback: types.CallbackQuery, state: FSMContext):
     if callback.data == 'set_active':
         new_status = 'active'
         status_emoji = EMOJI['active']
-        status_name = 'Active (с правами)'
+        status_name = 'Active'
+        rights_text = f"\n\n{EMOJI['perms']} <b>Будут выданы права</b> (в site_user)"
     else:
         new_status = 'inactive'
         status_emoji = EMOJI['inactive']
         status_name = 'Inactive'
+        rights_text = ""
     
     # Сохраняем выбор
     await state.update_data(new_status=new_status)
     
     data = await state.get_data()
     
-    # Текущий статус для отображения
-    _, current_emoji, current_text = check_user_status(data['current_status'])
+    # Текущий статус
+    if data['current_status'] == 'active':
+        current_text = f"{EMOJI['active']} Active"
+    else:
+        current_text = f"{EMOJI['inactive']} Inactive"
     
     confirm = f"""
-{EMOJI['warning']} <b>Подтверждение изменения</b>
+{EMOJI['warning']} <b>Подтверждение</b>
 ━━━━━━━━━━━━━━━━━━━━━━
 👤 <b>Пользователь:</b> {data['username']}
 📧 <b>Email:</b> {data['email']}
-{current_emoji} <b>Было:</b> {current_text}
-{status_emoji} <b>Станет:</b> {status_name}
+{EMOJI['arrow']} <b>Было:</b> {current_text}
+{status_emoji} <b>Станет:</b> {status_name}{rights_text}
 
 <b>Точно изменить?</b>
     """
-    
-    # Добавляем инфу о правах если выбирают Active
-    if new_status == 'active':
-        confirm += f"\n\n{EMOJI['perms']} <b>Будут выданы права:</b>\n"
-        for perm in ACTIVE_PERMISSIONS.keys():
-            confirm += f"• {perm}\n"
     
     kb = InlineKeyboardMarkup(row_width=2)
     kb.add(
@@ -388,47 +403,67 @@ async def confirm_change(callback: types.CallbackQuery, state: FSMContext):
     
     processing = await bot.send_message(
         callback.from_user.id,
-        f"{EMOJI['refresh']} Обновляю статус в MySQL..."
+        f"{EMOJI['refresh']} Обновляю данные..."
     )
     
-    # Меняем статус (для active автоматически подставляются права)
-    success, msg = update_user_status(data['user_id'], data['new_status'])
+    # 1. Сначала меняем статус в site_users
+    status_success, status_msg = update_user_status(data['user_id'], data['new_status'])
+    
+    if not status_success:
+        await processing.delete()
+        await bot.send_message(
+            callback.from_user.id,
+            f"{EMOJI['error']} Ошибка обновления статуса: {status_msg}"
+        )
+        await state.finish()
+        return
+    
+    # 2. Если выбрали Active - выдаем права в site_user
+    perms_success = True
+    perms_msg = ""
+    
+    if data['new_status'] == 'active':
+        perms_success, perms_msg = update_user_permissions(data['user_id'])
     
     await processing.delete()
     
-    if success:
-        if data['new_status'] == 'active':
-            result_emoji = EMOJI['active']
-            result_text = "Active"
-            rights_text = f"\n\n{EMOJI['perms']} <b>Выданы все права:</b>\n11 прав доступа"
-        else:
-            result_emoji = EMOJI['inactive']
-            result_text = "Inactive"
-            rights_text = ""
-        
-        final = f"""
-{EMOJI['success']} <b>Статус обновлен!</b>
+    # Формируем результат
+    if data['new_status'] == 'active':
+        if perms_success:
+            final = f"""
+{EMOJI['success']} <b>Готово!</b>
 ━━━━━━━━━━━━━━━━━━━━━━
 👤 <b>Пользователь:</b> {data['username']}
-📧 <b>Email:</b> {data['email']}
-{result_emoji} <b>Новый статус:</b> {result_text}{rights_text}
+{EMOJI['active']} <b>Статус:</b> Active (изменен в site_users)
+{EMOJI['perms']} <b>Права:</b> Выданы все 11 прав (в site_user)
 
-{EMOJI['db']} Изменения сохранены в MySQL
-        """
+✅ Статус обновлен
+✅ Права выданы
+            """
+        else:
+            final = f"""
+{EMOJI['warning']} <b>Частично выполнено</b>
+━━━━━━━━━━━━━━━━━━━━━━
+👤 <b>Пользователь:</b> {data['username']}
+{EMOJI['active']} <b>Статус:</b> Active (изменен)
+
+{EMOJI['error']} <b>Ошибка выдачи прав:</b> {perms_msg}
+
+Статус изменен, но права не выданы
+            """
     else:
         final = f"""
-{EMOJI['error']} <b>Ошибка!</b>
+{EMOJI['success']} <b>Готово!</b>
 ━━━━━━━━━━━━━━━━━━━━━━
 👤 <b>Пользователь:</b> {data['username']}
-<b>Ошибка:</b> {msg}
+{EMOJI['inactive']} <b>Статус:</b> Inactive
 
-Попробуй еще раз или проверь подключение к БД
+Статус обновлен в site_users
         """
     
     kb = InlineKeyboardMarkup(row_width=2)
     kb.add(
         InlineKeyboardButton(f"{EMOJI['menu']} В меню", callback_data="menu"),
-        InlineKeyboardButton(f"{EMOJI['db']} Проверить БД", callback_data="checkdb"),
         InlineKeyboardButton(f"{EMOJI['cancel']} Закрыть", callback_data="close")
     )
     
@@ -464,11 +499,6 @@ async def cancel_all(callback: types.CallbackQuery, state: FSMContext):
     )
 
 # Проверка БД
-@dp.callback_query_handler(lambda c: c.data == 'checkdb')
-async def check_db_callback(callback: types.CallbackQuery):
-    await bot.answer_callback_query(callback.id)
-    await check_db(callback.message)
-
 @dp.message_handler(commands=['checkdb'])
 async def check_db(message: types.Message):
     status_msg = await message.reply(f"{EMOJI['refresh']} Проверка подключения...")
@@ -487,32 +517,48 @@ async def check_db(message: types.Message):
         cursor.execute("SELECT VERSION()")
         version = cursor.fetchone()
         
-        # Проверяем таблицу
-        cursor.execute("SHOW TABLES LIKE 'site_users'")
-        if cursor.fetchone():
-            cursor.execute("SELECT COUNT(*) FROM site_users")
-            total = cursor.fetchone()[0]
-            
-            # Считаем активных (у кого есть JSON с правами)
-            cursor.execute("SELECT COUNT(*) FROM site_users WHERE status LIKE '{%}'")
-            active_with_perms = cursor.fetchone()[0]
-            
-            cursor.execute("SELECT COUNT(*) FROM site_users WHERE status = 'active'")
-            active_old = cursor.fetchone()[0]
-            
-            active = active_with_perms + active_old
-            
-            text = f"""
+        text = f"""
 {EMOJI['success']} <b>MySQL подключен</b>
 ━━━━━━━━━━━━━━━━━━━━━━
 {EMOJI['mysql']} <b>Хост:</b> {MYSQL_CONFIG['host']}
 {EMOJI['db']} <b>Версия:</b> {version[0]}
-{EMOJI['users']} <b>Всего пользователей:</b> {total}
-{EMOJI['active']} <b>Active (с правами):</b> {active}
-{EMOJI['inactive']} <b>Inactive:</b> {total - active}
+
+<b>Таблицы:</b>
+        """
+        
+        # Проверяем site_users
+        cursor.execute("SHOW TABLES LIKE 'site_users'")
+        if cursor.fetchone():
+            cursor.execute("SELECT COUNT(*) FROM site_users")
+            total_users = cursor.fetchone()[0]
+            
+            cursor.execute("SELECT COUNT(*) FROM site_users WHERE status = 'active'")
+            active_users = cursor.fetchone()[0]
+            
+            cursor.execute("SELECT COUNT(*) FROM site_users WHERE status = 'inactive'")
+            inactive_users = cursor.fetchone()[0]
+            
+            text += f"""
+{EMOJI['users']} <b>site_users:</b>
+   • Всего: {total_users}
+   • Active: {active_users}
+   • Inactive: {inactive_users}
             """
         else:
-            text = f"{EMOJI['error']} Таблица 'site_users' не найдена"
+            text += f"\n{EMOJI['error']} site_users: НЕТ"
+        
+        # Проверяем site_user
+        cursor.execute("SHOW TABLES LIKE 'site_user'")
+        if cursor.fetchone():
+            cursor.execute("SELECT COUNT(*) FROM site_user")
+            total_perms = cursor.fetchone()[0]
+            
+            text += f"""
+{EMOJI['perms']} <b>site_user:</b>
+   • Всего записей: {total_perms}
+            """
+        else:
+            text += f"\n{EMOJI['error']} site_user: НЕТ"
         
         conn.close()
         
@@ -531,36 +577,22 @@ async def close_msg(callback: types.CallbackQuery):
     await bot.answer_callback_query(callback.id)
     await bot.delete_message(callback.from_user.id, callback.message.message_id)
 
-# Помощь
-@dp.message_handler(commands=['help'])
-async def help_cmd(message: types.Message):
-    text = f"""
-{EMOJI['info']} <b>Команды бота</b>
-━━━━━━━━━━━━━━━━━━━━━━
-/menu - список пользователей
-/checkdb - проверка MySQL
-/help - это меню
-
-{EMOJI['perms']} <b>Права для Active:</b>
-{chr(10).join([f'• {perm}' for perm in ACTIVE_PERMISSIONS.keys()])}
-
-{EMOJI['active']} <b>Active</b> - JSON со всеми правами
-{EMOJI['inactive']} <b>Inactive</b> - пусто
-    """
-    
-    await message.reply(text, parse_mode="HTML")
-
 # Запуск
 if __name__ == '__main__':
     print(f"""
 {EMOJI['rocket']} ══════════════════════════════════════
-{EMOJI['rocket']}  Бот с правами запущен
+{EMOJI['rocket']}  Бот запущен
 {EMOJI['rocket']} ══════════════════════════════════════
 {EMOJI['mysql']}  Хост: {MYSQL_CONFIG['host']}
-{EMOJI['users']}  Таблица: site_users
-{EMOJI['perms']}  Права: 11 прав для Active
-{EMOJI['active']}  Active → JSON с правами
-{EMOJI['inactive']}  Inactive → пусто
+
+{EMOJI['users']}  site_users:
+   • status: active / inactive
+
+{EMOJI['perms']}  site_user:
+   • permissions: JSON с правами
+
+{EMOJI['active']}  Active → status = active + права в site_user
+{EMOJI['inactive']}  Inactive → status = inactive
 {EMOJI['rocket']} ══════════════════════════════════════
     """)
     
