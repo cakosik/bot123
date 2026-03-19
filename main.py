@@ -61,7 +61,11 @@ EMOJIS = {
     "star": "⭐",
     "mysql": "🐬",
     "lock": "🔒",
-    "refresh": "🔄"
+    "refresh": "🔄",
+    "active": "🟢",
+    "inactive": "🔴",
+    "key": "🔑",
+    "check": "🔍"
 }
 
 # Функция для подключения к MySQL
@@ -88,12 +92,31 @@ async def check_database(message: types.Message):
             cursor.execute("SELECT DATABASE()")
             db_name = cursor.fetchone()
             
+            # Проверяем структуру таблицы
+            cursor.execute("""
+                SELECT COLUMN_NAME, DATA_TYPE 
+                FROM INFORMATION_SCHEMA.COLUMNS 
+                WHERE TABLE_NAME = 'site_users' 
+                AND TABLE_SCHEMA = %s
+            """, (MYSQL_CONFIG['database'],))
+            columns = cursor.fetchall()
+            
+            columns_info = ""
+            if columns:
+                columns_info = "\n".join([f"  • {col[0]} ({col[1]})" for col in columns[:5]])
+                if len(columns) > 5:
+                    columns_info += f"\n  • ... и еще {len(columns) - 5} полей"
+            
             success_text = f"""
 {EMOJIS['success']} <b>Подключение к MySQL успешно!</b>
 ━━━━━━━━━━━━━━━━━━━━━━
 {EMOJIS['mysql']} <b>Версия MySQL:</b> {version[0]}
 {EMOJIS['database']} <b>База данных:</b> {db_name[0]}
 {EMOJIS['lock']} <b>Хост:</b> {MYSQL_CONFIG['host']}:{MYSQL_CONFIG['port']}
+{EMOJIS['users']} <b>Таблица site_users:</b> {'Найдена' if columns else 'НЕ НАЙДЕНА'}
+
+{EMOJIS['check']} <b>Поля таблицы:</b>
+{columns_info if columns else 'Таблица не существует'}
             """
             
             await status_msg.edit_text(success_text, parse_mode="HTML")
@@ -118,12 +141,16 @@ def get_users_list():
     
     try:
         cursor = conn.cursor(dictionary=True)
-        # Предполагаем, что таблица называется site_users
-        # Измените запрос под вашу структуру БД
+        # Получаем пользователей с информацией о статусе
         cursor.execute("""
             SELECT id, username, email, status 
             FROM site_users 
-            ORDER BY username
+            ORDER BY 
+                CASE 
+                    WHEN status = 'active' THEN 1 
+                    ELSE 2 
+                END,
+                username
         """)
         users = cursor.fetchall()
         conn.close()
@@ -132,16 +159,16 @@ def get_users_list():
         logger.error(f"Ошибка получения пользователей: {e}")
         return []
 
-# Функция для обновления статуса пользователя
-def update_user_status(user_id):
+# Функция для активации пользователя (изменение status на 'active' с правами)
+def activate_user(user_id):
     conn = get_db_connection()
     if not conn:
-        return False
+        return False, "Ошибка подключения к БД"
     
     try:
         cursor = conn.cursor()
         
-        # Создаем JSON с правами
+        # Создаем JSON с правами для активного пользователя
         permissions = {
             "view_logs": True,
             "view_admin_logs": True,
@@ -156,9 +183,10 @@ def update_user_status(user_id):
             "manage_users": True
         }
         
+        # Устанавливаем статус 'active' и сохраняем права в JSON
         permissions_json = json.dumps(permissions, ensure_ascii=False)
         
-        # Обновляем статус пользователя
+        # Обновляем статус пользователя на 'active' с правами
         cursor.execute("""
             UPDATE site_users 
             SET status = %s 
@@ -167,12 +195,36 @@ def update_user_status(user_id):
         
         conn.commit()
         affected_rows = cursor.rowcount
+        
+        # Получаем обновленную информацию о пользователе
+        cursor.execute("SELECT username, email FROM site_users WHERE id = %s", (user_id,))
+        user_info = cursor.fetchone()
+        
         conn.close()
         
-        return affected_rows > 0
+        if affected_rows > 0:
+            return True, user_info
+        else:
+            return False, "Пользователь не найден"
     except Error as e:
-        logger.error(f"Ошибка обновления статуса: {e}")
-        return False
+        logger.error(f"Ошибка активации пользователя: {e}")
+        return False, str(e)
+
+# Функция для проверки текущего статуса пользователя
+def check_user_status(user_id):
+    conn = get_db_connection()
+    if not conn:
+        return None
+    
+    try:
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("SELECT username, email, status FROM site_users WHERE id = %s", (user_id,))
+        user = cursor.fetchone()
+        conn.close()
+        return user
+    except Error as e:
+        logger.error(f"Ошибка проверки статуса: {e}")
+        return None
 
 # Команда /start
 @dp.message_handler(commands=['start'])
@@ -180,9 +232,10 @@ async def cmd_start(message: types.Message):
     welcome_text = f"""
 {EMOJIS['rocket']} <b>Добро пожаловать в Admin Panel Bot (MySQL Edition)!</b>
 
-Этот бот позволяет управлять правами пользователей в системе через удаленную MySQL базу данных.
+Этот бот позволяет активировать пользователей и выдавать им все права в системе через удаленную MySQL базу данных.
 
 {EMOJIS['mysql']} <b>Подключение к MySQL:</b> {MYSQL_CONFIG['host']}
+{EMOJIS['active']} <b>Режим работы:</b> Активация аккаунтов (status = 'active' с правами)
 
 <b>Доступные команды:</b>
 {EMOJIS['menu']} /menu - Просмотр списка пользователей
@@ -254,12 +307,18 @@ async def show_users_menu(message: types.Message):
     # Удаляем сообщение о загрузке
     await loading_msg.delete()
     
+    # Подсчитываем статистику
+    active_count = sum(1 for user in users if user['status'] == 'active' or 
+                      (user['status'] and user['status'].startswith('{')))
+    inactive_count = len(users) - active_count
+    
     # Создаем красивый заголовок
     header = f"""
 {EMOJIS['users']} <b>Список пользователей</b> ({len(users)})
+{EMOJIS['active']} Активных: {active_count} | {EMOJIS['inactive']} Неактивных: {inactive_count}
 ━━━━━━━━━━━━━━━━━━━━━━
 {EMOJIS['mysql']} <b>MySQL:</b> {MYSQL_CONFIG['host']}
-<i>Выберите пользователя для редактирования прав:</i>
+<i>Выберите пользователя для активации:</i>
     """
     
     # Создаем клавиатуру с пользователями
@@ -269,23 +328,27 @@ async def show_users_menu(message: types.Message):
         username = user['username'] if user['username'] else "Без имени"
         email = user['email'] if user['email'] else "Нет email"
         
-        # Проверяем текущий статус
-        try:
-            if user['status']:
-                status_data = json.loads(user['status']) if isinstance(user['status'], str) else user['status']
-                has_permissions = any(status_data.values()) if isinstance(status_data, dict) else False
-            else:
-                has_permissions = False
-        except:
-            has_permissions = False
+        # Определяем статус пользователя
+        is_active = False
+        if user['status']:
+            if user['status'] == 'active':
+                is_active = True
+            elif user['status'].startswith('{'):
+                try:
+                    status_data = json.loads(user['status'])
+                    if isinstance(status_data, dict) and any(status_data.values()):
+                        is_active = True
+                except:
+                    pass
         
-        status_emoji = EMOJIS['success'] if has_permissions else EMOJIS['error']
+        status_emoji = EMOJIS['active'] if is_active else EMOJIS['inactive']
+        status_text = "Активен" if is_active else "Неактивен"
         
         # Обрезаем длинные имена
         display_name = username[:20] + "..." if len(username) > 20 else username
         display_email = email[:25] + "..." if len(email) > 25 else email
         
-        button_text = f"{status_emoji} {display_name} | {display_email}"
+        button_text = f"{status_emoji} {display_name} | {display_email} [{status_text}]"
         
         keyboard.add(
             InlineKeyboardButton(
@@ -316,52 +379,77 @@ async def process_user_selection(callback_query: types.CallbackQuery, state: FSM
     )
     
     # Получаем информацию о пользователе
-    conn = get_db_connection()
-    if not conn:
-        await bot.send_message(
-            callback_query.from_user.id,
-            f"{EMOJIS['error']} Ошибка подключения к базе данных MySQL"
-        )
-        return
-    
-    cursor = conn.cursor(dictionary=True)
-    cursor.execute("SELECT username, email, status FROM site_users WHERE id = %s", (user_id,))
-    user = cursor.fetchone()
-    conn.close()
+    user = check_user_status(user_id)
     
     if not user:
         await bot.send_message(
             callback_query.from_user.id,
-            f"{EMOJIS['error']} Пользователь не найден"
+            f"{EMOJIS['error']} Пользователь не найден или ошибка подключения к БД"
         )
         return
     
     # Сохраняем ID пользователя в состояние
     await state.update_data(selected_user_id=user_id, selected_user_name=user['username'])
     
-    # Проверяем текущие права
-    current_status = "Нет прав"
-    if user['status']:
-        try:
-            status_data = json.loads(user['status']) if isinstance(user['status'], str) else user['status']
-            if isinstance(status_data, dict):
-                active_permissions = [k for k, v in status_data.items() if v]
-                if active_permissions:
-                    current_status = f"Есть права ({len(active_permissions)} активных)"
-        except:
-            current_status = "Ошибка в формате прав"
+    # Проверяем текущий статус
+    is_active = False
+    status_display = "Неактивен"
     
-    # Показываем информацию о пользователе
+    if user['status']:
+        if user['status'] == 'active':
+            is_active = True
+            status_display = "Активен (active)"
+        elif user['status'].startswith('{'):
+            try:
+                status_data = json.loads(user['status'])
+                if isinstance(status_data, dict):
+                    active_permissions = sum(1 for v in status_data.values() if v)
+                    status_display = f"Активен с правами ({active_permissions} прав)"
+                    is_active = True
+                else:
+                    status_display = "Неактивен (неверный формат)"
+            except:
+                status_display = "Неактивен (ошибка парсинга)"
+    
+    # Если пользователь уже активен
+    if is_active:
+        already_active_text = f"""
+{EMOJIS['warning']} <b>Пользователь уже активирован!</b>
+━━━━━━━━━━━━━━━━━━━━━━
+👤 <b>Имя:</b> {user['username']}
+📧 <b>Email:</b> {user['email']}
+{EMOJIS['active']} <b>Текущий статус:</b> {status_display}
+
+Данный пользователь уже имеет активный статус в системе.
+Повторная активация не требуется.
+        """
+        
+        keyboard = InlineKeyboardMarkup(row_width=2)
+        keyboard.add(
+            InlineKeyboardButton(f"{EMOJIS['menu']} Вернуться в меню", callback_data="menu"),
+            InlineKeyboardButton(f"{EMOJIS['cancel']} Закрыть", callback_data="close")
+        )
+        
+        await bot.send_message(
+            callback_query.from_user.id,
+            already_active_text,
+            parse_mode="HTML",
+            reply_markup=keyboard
+        )
+        await state.finish()
+        return
+    
+    # Показываем информацию о пользователе для активации
     user_info = f"""
 {EMOJIS['info']} <b>Информация о пользователе:</b>
 ━━━━━━━━━━━━━━━━━━━━━━
 👤 <b>Имя:</b> {user['username']}
 📧 <b>Email:</b> {user['email']}
-📊 <b>Текущий статус:</b> {current_status}
+{EMOJIS['inactive']} <b>Текущий статус:</b> {status_display}
 
-{EMOJIS['warning']} <b>Вы уверены, что хотите выдать ВСЕ права этому пользователю?</b>
+{EMOJIS['key']} <b>Вы уверены, что хотите АКТИВИРОВАТЬ этого пользователя?</b>
 
-<b>Права которые будут выданы:</b>
+<b>При активации будут выданы права:</b>
 • Просмотр логов (view_logs)
 • Просмотр логов администратора (view_admin_logs)
 • Просмотр Forbes (view_forbes)
@@ -375,12 +463,13 @@ async def process_user_selection(callback_query: types.CallbackQuery, state: FSM
 • Управление пользователями (manage_users)
 
 {EMOJIS['mysql']} <b>База данных:</b> {MYSQL_CONFIG['database']}
+{EMOJIS['active']} <b>Новый статус:</b> active (с JSON правами)
     """
     
     # Создаем клавиатуру подтверждения
     keyboard = InlineKeyboardMarkup(row_width=2)
     keyboard.add(
-        InlineKeyboardButton(f"{EMOJIS['confirm']} Подтвердить", callback_data="confirm_yes"),
+        InlineKeyboardButton(f"{EMOJIS['confirm']} Активировать", callback_data="confirm_yes"),
         InlineKeyboardButton(f"{EMOJIS['cancel']} Отмена", callback_data="cancel")
     )
     
@@ -393,7 +482,7 @@ async def process_user_selection(callback_query: types.CallbackQuery, state: FSM
     
     await UserStates.confirming.set()
 
-# Обработчик подтверждения
+# Обработчик подтверждения активации
 @dp.callback_query_handler(lambda c: c.data == 'confirm_yes', state=UserStates.confirming)
 async def process_confirmation(callback_query: types.CallbackQuery, state: FSMContext):
     await bot.answer_callback_query(callback_query.id)
@@ -401,7 +490,7 @@ async def process_confirmation(callback_query: types.CallbackQuery, state: FSMCo
     # Показываем статус обработки
     processing_msg = await bot.send_message(
         callback_query.from_user.id,
-        f"{EMOJIS['refresh']} Обновление прав пользователя в MySQL..."
+        f"{EMOJIS['refresh']} Активация пользователя в MySQL..."
     )
     
     # Получаем данные из состояния
@@ -409,35 +498,45 @@ async def process_confirmation(callback_query: types.CallbackQuery, state: FSMCo
     user_id = data.get('selected_user_id')
     user_name = data.get('selected_user_name')
     
-    # Обновляем статус пользователя
-    success = update_user_status(user_id)
+    # Активируем пользователя
+    success, result = activate_user(user_id)
     
     if success:
+        # result содержит информацию о пользователе
+        user_info = result
+        
         result_text = f"""
-{EMOJIS['success']} <b>Успешно!</b>
+{EMOJIS['success']} <b>Пользователь успешно активирован!</b>
+━━━━━━━━━━━━━━━━━━━━━━
+{EMOJIS['active']} <b>Пользователь:</b> {user_name}
+{EMOJIS['mysql']} <b>Статус изменен на:</b> active (с полными правами)
 
-Пользователю <b>{user_name}</b> выданы все права доступа.
+<b>Выданные права:</b>
+✓ Просмотр всех логов
+✓ Управление конфигурацией
+✓ Управление пользователями
+✓ И другие привилегии
 
-{EMOJIS['mysql']} <b>Изменения сохранены в MySQL</b>
-{EMOJIS['rocket']} Права активированы немедленно.
-
-<i>Статус пользователя обновлен в базе данных.</i>
+{EMOJIS['database']} <b>Изменения сохранены в MySQL</b>
+{EMOJIS['rocket']} Пользователь может войти в систему с полными правами.
         """
     else:
         result_text = f"""
-{EMOJIS['error']} <b>Ошибка!</b>
+{EMOJIS['error']} <b>Ошибка активации!</b>
+━━━━━━━━━━━━━━━━━━━━━━
+{EMOJIS['users']} <b>Пользователь:</b> {user_name}
 
-Не удалось обновить права пользователя <b>{user_name}</b> в MySQL.
-
-<b>Возможные причины:</b>
-• Потеря соединения с MySQL
-• Недостаточно прав для обновления
-• Пользователь с ID {user_id} не найден
+<b>Причина ошибки:</b>
+<code>{result}</code>
 
 {EMOJIS['mysql']} <b>Хост:</b> {MYSQL_CONFIG['host']}
 {EMOJIS['database']} <b>База:</b> {MYSQL_CONFIG['database']}
 
-Используйте /checkdb для диагностики подключения.
+<b>Рекомендации:</b>
+• Проверьте подключение к MySQL
+• Убедитесь, что пользователь существует
+• Проверьте права на запись в таблицу
+• Используйте /checkdb для диагностики
         """
     
     # Удаляем сообщение о обработке
@@ -498,7 +597,7 @@ async def process_close(callback_query: types.CallbackQuery):
 # Функция отображения справки
 async def show_help(message: types.Message):
     help_text = f"""
-{EMOJIS['info']} <b>Справка по боту (MySQL Edition)</b>
+{EMOJIS['info']} <b>Справка по боту (MySQL Edition - Активация)</b>
 ━━━━━━━━━━━━━━━━━━━━━━
 
 <b>📊 Информация о подключении:</b>
@@ -506,26 +605,34 @@ async def show_help(message: types.Message):
 {EMOJIS['database']} <b>База данных:</b> {MYSQL_CONFIG['database']}
 {EMOJIS['users']} <b>Таблица:</b> site_users
 
+<b>🎯 Функционал бота:</b>
+• Активация пользователей (status = 'active' с JSON правами)
+• Просмотр списка всех пользователей
+• Проверка текущего статуса
+• Диагностика подключения к MySQL
+
 <b>🤖 Доступные команды:</b>
 /start - Начало работы
 /menu - Открыть меню пользователей
 /checkdb - Проверить подключение к MySQL
 /help - Показать эту справку
 
-<b>📝 Как это работает:</b>
+<b>📝 Процесс активации:</b>
 1. Бот подключается к удаленной MySQL БД
 2. Получает список пользователей из таблицы site_users
 3. Вы выбираете пользователя из списка
-4. Подтверждаете выдачу всех прав
-5. Бот обновляет поле status в MySQL
+4. Бот показывает текущий статус
+5. При подтверждении - статус меняется на 'active' с JSON правами
 
 <b>🔧 Настройки подключения:</b>
 <code>host: {MYSQL_CONFIG['host']}
 database: {MYSQL_CONFIG['database']}
 user: {MYSQL_CONFIG['user']}</code>
 
-{EMOJIS['warning']} <b>Внимание:</b>
-Выдача прав дает пользователю ПОЛНЫЙ доступ к административной панели!
+{EMOJIS['warning']} <b>Важно:</b>
+• Активация дает пользователю ПОЛНЫЙ доступ к административной панели
+• Проверяйте правильность выбора пользователя перед активацией
+• Бот не может деактивировать пользователей
     """
     
     keyboard = InlineKeyboardMarkup(row_width=2)
@@ -568,11 +675,12 @@ async def handle_all_messages(message: types.Message):
 if __name__ == '__main__':
     print(f"""
 {EMOJIS['rocket']} ═══════════════════════════════════════
-{EMOJIS['rocket']}  Запуск MySQL Admin Bot
+{EMOJIS['rocket']}  Запуск MySQL Admin Bot - Активация
 {EMOJIS['rocket']} ═══════════════════════════════════════
 {EMOJIS['mysql']}  MySQL Host: {MYSQL_CONFIG['host']}
 {EMOJIS['database']}  Database: {MYSQL_CONFIG['database']}
 {EMOJIS['users']}  Table: site_users
+{EMOJIS['active']}  Mode: Активация аккаунтов (status = 'active' + права)
 {EMOJIS['rocket']} ═══════════════════════════════════════
     """)
     
@@ -580,6 +688,23 @@ if __name__ == '__main__':
     test_conn = get_db_connection()
     if test_conn:
         print(f"{EMOJIS['success']} Подключение к MySQL успешно установлено")
+        
+        # Проверяем структуру таблицы
+        try:
+            cursor = test_conn.cursor()
+            cursor.execute("SHOW COLUMNS FROM site_users")
+            columns = cursor.fetchall()
+            print(f"{EMOJIS['users']} Таблица site_users найдена, полей: {len(columns)}")
+            
+            # Проверяем наличие поля status
+            status_field = any(col[0] == 'status' for col in columns)
+            if status_field:
+                print(f"{EMOJIS['success']} Поле 'status' найдено")
+            else:
+                print(f"{EMOJIS['warning']} Поле 'status' не найдено в таблице!")
+        except Error as e:
+            print(f"{EMOJIS['warning']} Не удалось проверить структуру таблицы: {e}")
+        
         test_conn.close()
     else:
         print(f"{EMOJIS['warning']} Предупреждение: Не удалось подключиться к MySQL")
